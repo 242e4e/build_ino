@@ -1,0 +1,35 @@
+name: build-wie-jni
+on:
+  workflow_dispatch: {}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone wie and apply fix patch
+        run: |
+          git clone https://github.com/dlunch/wie.git wie
+          cd wie
+          git apply ../wie-inotia2.patch
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+
+      - name: Build libwie_jni.so (arm64-v8a)
+        working-directory: wie_jni
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a -o ../jniLibs build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libwie_jni-arm64
+          path: jniLibs/arm64-v8a/libwie_jni.so
