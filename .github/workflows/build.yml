@@ -14,6 +14,8 @@ jobs:
           git apply ../wie-inotia2.patch
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
