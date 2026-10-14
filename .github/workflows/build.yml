@@ -7,12 +7,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone wie and apply fix patch
-        run: |
-          git clone https://github.com/dlunch/wie.git wie
-          cd wie
-          git apply ../wie-inotia2.patch
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -25,10 +19,1624 @@ jobs:
         with:
           ndk-version: r27c
 
+      - name: Write sources
+        run: |
+          rm -rf wie_jni
+          mkdir -p $(dirname wie_jni/Cargo.toml)
+          cat > wie_jni/Cargo.toml <<'WIE_EOF'
+          [package]
+          name = "wie_jni"
+          version = "0.2.0"
+          edition = "2024"
+          license = "MIT"
+          description = "JNI glue that lets the existing net.wie.app.WieActivity shell run on upstream wie"
+          publish = false
+
+          [lib]
+          crate-type = ["cdylib", "rlib"]
+
+          [features]
+          # The JIT backend needs a newer rustc than some hosts have; turning it off keeps
+          # the crate buildable there (the emulator then falls back to the interpreter).
+          default = ["jit"]
+          jit = ["dep:wie-core-arm-native"]
+
+          [dependencies]
+          anyhow = "1"
+          async-trait = "0.1"
+          jni = { version = "0.21", default-features = false }
+          tracing = "0.1"
+          tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+
+          wie = { path = "../wie", default-features = false }
+          wie-backend = { path = "../wie/wie-backend" }
+          wie-core-arm-native = { path = "../wie/wie-core-arm-native", optional = true }
+          wie-util = { path = "../wie/wie-util" }
+
+          [dev-dependencies]
+          png = "0.17"
+
+          [profile.release]
+          lto = true
+          codegen-units = 1
+          opt-level = 3
+          panic = "unwind"
+          WIE_EOF
+          mkdir -p $(dirname wie_jni/src/lib.rs)
+          cat > wie_jni/src/lib.rs <<'WIE_EOF'
+          //! `libwie_jni.so` for the `net.wie.app` Android shell, built on upstream wie.
+          //!
+          //! The Java side (WieActivity/GameView/PadCfg) is unchanged; this crate only has to
+          //! honour the contract it expects from `net.wie.app.WieNative`:
+          //!
+          //! * `nativeInit(zip, filesDir) -> int` — 0 on success, otherwise see `nativeLastError`.
+          //! * `nativeTick()` — called ~60 times per second on the game thread, followed by
+          //!   draining `nativePollOut()` until it returns null.
+          //! * `nativeKey(code, down)` — 1..4 = UP DOWN LEFT RIGHT, 5 OK, 6 LSK, 7 RSK, 8 CLEAR,
+          //!   9 CALL, 10..19 = NUM0..NUM9, 20 STAR, 21 HASH, 22 HANGUP.
+          //! * `nativePollOut() -> byte[]` — first byte is a tag:
+          //!   0 = play SFX (rest: SMAF bytes), 1 = play BGM loop (rest: SMAF bytes),
+          //!   2 = stop (`[2, 1]` BGM, `[2, 0]` SFX), 3 = vibrate (u32 LE milliseconds),
+          //!   4 = PCM (u32 LE sample rate, then i16 LE mono samples), 5 = volume (0..100).
+          //! * `nativeSetSurface(Surface)` — target for frames; null when destroyed.
+          //! * Saves live in `filesDir/wie_fs_v1` and `filesDir/wie_db_v1` (see `store`).
+
+          pub mod aot_cache;
+          pub mod overlay;
+          pub mod store;
+          pub mod window;
+
+          use std::{
+              cell::RefCell,
+              collections::{HashMap, HashSet, VecDeque},
+              panic::{AssertUnwindSafe, catch_unwind},
+              path::Path,
+              sync::{
+                  Mutex,
+                  atomic::{AtomicBool, AtomicU32, Ordering},
+              },
+              time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
+          };
+
+          use jni::{
+              JNIEnv,
+              objects::{JByteArray, JClass, JObject, JString},
+              sys::{jboolean, jbyteArray, jint},
+          };
+          use wie_backend::{
+              AudioCommand, AudioEventData, AudioHandle, Emulator, Event, Filesystem, Font, Instant, KeyCode, Options, Platform, Screen,
+              canvas::Image,
+          };
+
+          use crate::{store::Store, window::Frame};
+
+          const KEY_REPEAT: Duration = Duration::from_millis(100);
+          /// How long one `nativeTick()` may keep the guest running. The Java shell aims for a
+          /// 60Hz cadence (~16.6ms), so this leaves room for the shell's own per-frame work.
+          const FRAME_BUDGET: Duration = Duration::from_millis(14);
+          /// A work slice shorter than this means the executor had nothing runnable.
+          const IDLE_SLICE: Duration = Duration::from_micros(300);
+
+          /// `WIE_FRAME_BUDGET_MS` overrides the budget; 0 restores one slice per frame.
+          fn frame_budget() -> Duration {
+              static CACHED: Mutex<Option<Duration>> = Mutex::new(None);
+              let mut cached = lock(&CACHED);
+              *cached.get_or_insert_with(|| {
+                  std::env::var("WIE_FRAME_BUDGET_MS")
+                      .ok()
+                      .and_then(|value| value.parse::<u64>().ok())
+                      .map_or(FRAME_BUDGET, Duration::from_millis)
+              })
+          }
+
+          static WIDTH: AtomicU32 = AtomicU32::new(240);
+          static HEIGHT: AtomicU32 = AtomicU32::new(320);
+          static OUT: Mutex<VecDeque<Vec<u8>>> = Mutex::new(VecDeque::new());
+          static KEYS: Mutex<VecDeque<(KeyCode, bool)>> = Mutex::new(VecDeque::new());
+          static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+          static EXITED: AtomicBool = AtomicBool::new(false);
+
+          fn lock<T>(mutex: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+              mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+          }
+
+          fn push_out(message: Vec<u8>) {
+              let mut out = lock(&OUT);
+              // Never let an unread queue grow without bound (e.g. while paused).
+              if out.len() > 512 {
+                  out.pop_front();
+              }
+              out.push_back(message);
+          }
+
+          fn set_error(message: impl Into<String>) {
+              let message = message.into();
+              tracing::error!("{message}");
+              *lock(&LAST_ERROR) = message;
+          }
+
+          // ---------------------------------------------------------------- platform
+
+          struct JniScreen;
+
+          impl Screen for JniScreen {
+              fn resize(&self, width: u32, height: u32) -> wie_util::Result<()> {
+                  WIDTH.store(width, Ordering::Relaxed);
+                  HEIGHT.store(height, Ordering::Relaxed);
+                  Ok(())
+              }
+
+              fn request_redraw(&self) -> wie_util::Result<()> {
+                  REDRAW.store(true, Ordering::Relaxed);
+                  Ok(())
+              }
+
+              fn paint(&self, image: &dyn Image) {
+                  let (width, height) = (image.width(), image.height());
+                  let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+                  for color in image.colors() {
+                      rgba.extend_from_slice(&[color.r, color.g, color.b, 0xff]);
+                  }
+                  rgba.resize((width * height * 4) as usize, 0);
+                  overlay::note_frame();
+                  overlay::draw(&mut rgba, width, height, &overlay::status_line());
+                  window::present(Frame { width, height, rgba });
+              }
+
+              fn width(&self) -> u32 {
+                  WIDTH.load(Ordering::Relaxed)
+              }
+
+              fn height(&self) -> u32 {
+                  HEIGHT.load(Ordering::Relaxed)
+              }
+          }
+
+          static BGM_HANDLES: Mutex<Option<HashSet<AudioHandle>>> = Mutex::new(None);
+
+          struct JniAudioSink;
+
+          impl wie_backend::AudioSink for JniAudioSink {
+              fn send(&self, command: AudioCommand) {
+                  match command {
+                      AudioCommand::Play { handle, sequence, repeat } => {
+                          {
+                              let mut bgm = lock(&BGM_HANDLES);
+                              let bgm = bgm.get_or_insert_with(HashSet::new);
+                              if repeat {
+                                  bgm.insert(handle);
+                              } else {
+                                  bgm.remove(&handle);
+                              }
+                          }
+
+                          if let Some(source) = &sequence.source {
+                              let mut message = Vec::with_capacity(source.len() + 1);
+                              message.push(if repeat { 1 } else { 0 });
+                              message.extend_from_slice(source);
+                              push_out(message);
+                              return;
+                          }
+
+                          // No SMAF source: forward any raw PCM the sequence carries.
+                          for event in &sequence.events {
+                              if let AudioEventData::Wave {
+                                  channels,
+                                  sampling_rate,
+                                  samples,
+                              } = &event.data
+                              {
+                                  let channels = (*channels).max(1) as usize;
+                                  let mut message = Vec::with_capacity(5 + samples.len() / channels * 2);
+                                  message.push(4);
+                                  message.extend_from_slice(&sampling_rate.to_le_bytes());
+                                  for frame in samples.chunks(channels) {
+                                      let mixed = frame.iter().map(|&s| s as i32).sum::<i32>() / frame.len() as i32;
+                                      message.extend_from_slice(&(mixed as i16).to_le_bytes());
+                                  }
+                                  push_out(message);
+                              }
+                          }
+                      }
+                      AudioCommand::Stop { handle } => {
+                          let is_bgm = lock(&BGM_HANDLES).as_ref().is_some_and(|bgm| bgm.contains(&handle));
+                          push_out(vec![2, if is_bgm { 1 } else { 0 }]);
+                      }
+                  }
+              }
+          }
+
+          struct JniPlatform {
+              font: Font,
+              screen: JniScreen,
+              store: Store,
+          }
+
+          impl Platform for JniPlatform {
+              fn font(&self) -> &Font {
+                  &self.font
+              }
+
+              fn screen(&self) -> &dyn Screen {
+                  &self.screen
+              }
+
+              fn now(&self) -> Instant {
+                  let millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+                  Instant::from_epoch_millis(millis as _)
+              }
+
+              fn database_repository(&self) -> &dyn wie_backend::DatabaseRepository {
+                  &self.store
+              }
+
+              fn filesystem(&self) -> &dyn Filesystem {
+                  &self.store
+              }
+
+              fn audio_sink(&self) -> Box<dyn wie_backend::AudioSink> {
+                  Box::new(JniAudioSink)
+              }
+
+              fn write_stdout(&self, buf: &[u8]) {
+                  tracing::info!("[app] {}", String::from_utf8_lossy(buf).trim_end());
+              }
+
+              fn write_stderr(&self, buf: &[u8]) {
+                  tracing::warn!("[app] {}", String::from_utf8_lossy(buf).trim_end());
+              }
+
+              fn exit(&self) {
+                  tracing::info!("[app] exit requested");
+                  EXITED.store(true, Ordering::Relaxed);
+              }
+
+              fn vibrate(&self, duration_ms: u64, _intensity: u8) {
+                  let mut message = vec![3];
+                  message.extend_from_slice(&(duration_ms.min(u32::MAX as u64) as u32).to_le_bytes());
+                  push_out(message);
+              }
+          }
+
+          // ---------------------------------------------------------------- runtime
+
+          struct Runtime {
+              emulator: Box<dyn Emulator>,
+              store: Store,
+              ready: bool,
+              failed: bool,
+              held: HashMap<KeyCode, StdInstant>,
+          }
+
+          thread_local! {
+              // nativeInit and nativeTick both run on the game thread.
+              static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+          }
+
+          static REDRAW: AtomicBool = AtomicBool::new(false);
+
+          fn key_from_code(code: i32) -> Option<KeyCode> {
+              Some(match code {
+                  1 => KeyCode::UP,
+                  2 => KeyCode::DOWN,
+                  3 => KeyCode::LEFT,
+                  4 => KeyCode::RIGHT,
+                  5 => KeyCode::OK,
+                  6 => KeyCode::LEFT_SOFT_KEY,
+                  7 => KeyCode::RIGHT_SOFT_KEY,
+                  8 => KeyCode::CLEAR,
+                  9 => KeyCode::CALL,
+                  10 => KeyCode::NUM0,
+                  11 => KeyCode::NUM1,
+                  12 => KeyCode::NUM2,
+                  13 => KeyCode::NUM3,
+                  14 => KeyCode::NUM4,
+                  15 => KeyCode::NUM5,
+                  16 => KeyCode::NUM6,
+                  17 => KeyCode::NUM7,
+                  18 => KeyCode::NUM8,
+                  19 => KeyCode::NUM9,
+                  20 => KeyCode::STAR,
+                  21 => KeyCode::HASH,
+                  22 => KeyCode::HANGUP,
+                  _ => return None,
+              })
+          }
+
+          /// Starts the game in `zip` (a KTF/LGT/SKT archive), persisting saves under `data_dir`.
+          pub fn init(zip: Vec<u8>, data_dir: &Path) -> anyhow::Result<()> {
+              logging::init();
+              lock(&OUT).clear();
+              lock(&KEYS).clear();
+              EXITED.store(false, Ordering::Relaxed);
+
+              let store = Store::open(data_dir);
+              let platform = Box::new(JniPlatform {
+                  font: Font::try_from_static(include_bytes!("../../wie/assets/neodgm.ttf"))?,
+                  screen: JniScreen,
+                  store: store.clone(),
+              });
+
+              // Without a CompiledExecutor, wie falls back to stepping the ARM interpreter one
+              // instruction at a time, which is far too slow for this phone's ARMv8 core. The
+              // official wie-app frontend instead JIT-compiles hot code via wie-core-arm-native;
+              // we do the same, with compiled regions cached to disk so repeat launches skip
+              // recompilation.
+              #[cfg(feature = "jit")]
+              let aot = {
+                  let cache = Box::new(aot_cache::FileCache::new(data_dir.join("aot_cache")));
+                  Some(Box::new(wie_core_arm_native::NativeExecutor::new(Some(cache))) as Box<_>)
+              };
+              #[cfg(not(feature = "jit"))]
+              let aot = None;
+
+              let options = Options {
+                  enable_gdbserver: false,
+                  aot,
+                  profile: None,
+              };
+              let emulator = wie::load_emulator("game.zip", zip, platform, options)?;
+              tracing::info!("[init] emulator created, screen {}x{}", WIDTH.load(Ordering::Relaxed), HEIGHT.load(Ordering::Relaxed));
+
+              RUNTIME.with_borrow_mut(|runtime| {
+                  *runtime = Some(Runtime {
+                      emulator,
+                      store,
+                      ready: false,
+                      failed: false,
+                      held: HashMap::new(),
+                  })
+              });
+              Ok(())
+          }
+
+          /// Advances the emulator by one frame. Returns false once it has stopped.
+          pub fn tick() -> bool {
+              RUNTIME.with_borrow_mut(|runtime| {
+                  let Some(runtime) = runtime.as_mut() else { return false };
+                  if runtime.failed || EXITED.load(Ordering::Relaxed) {
+                      runtime.store.flush(true);
+                      return false;
+                  }
+
+                  let now = StdInstant::now();
+                  let keys: Vec<(KeyCode, bool)> = lock(&KEYS).drain(..).collect();
+                  for (key, down) in keys {
+                      if down {
+                          if runtime.ready && !runtime.held.contains_key(&key) {
+                              runtime.emulator.handle_event(Event::Keydown(key));
+                              runtime.held.insert(key, now);
+                          }
+                      } else if runtime.held.remove(&key).is_some() {
+                          runtime.emulator.handle_event(Event::Keyup(key));
+                      }
+                  }
+                  for (key, since) in runtime.held.iter_mut() {
+                      if now.duration_since(*since) > KEY_REPEAT {
+                          runtime.emulator.handle_event(Event::Keyrepeat(*key));
+                          *since = now;
+                      }
+                  }
+
+                  if REDRAW.swap(false, Ordering::Relaxed) {
+                      runtime.emulator.handle_event(Event::Redraw);
+                  }
+
+                  // `Emulator::tick` is one work slice, not one frame: wie's executor runs for at
+                  // most 8ms and returns. The upstream frontend calls it back-to-back (1ms poll),
+                  // so the guest gets essentially all of the wall clock. The Java shell here calls
+                  // nativeTick() only once per 60Hz frame, which would hand the guest well under
+                  // half of real time and run the game in slow motion. Keep slicing until the
+                  // frame budget is spent, and stop early once the executor goes idle so a game
+                  // that is merely waiting on a timer does not busy-burn the budget.
+                  let deadline = now + frame_budget();
+                  loop {
+                      let slice_start = StdInstant::now();
+                      if let Err(error) = runtime.emulator.tick() {
+                          runtime.failed = true;
+                          set_error(format!("emulator stopped: {error}"));
+                          runtime.store.flush(true);
+                          return false;
+                      }
+                      let idle = slice_start.elapsed() < IDLE_SLICE;
+                      if idle || StdInstant::now() >= deadline {
+                          break;
+                      }
+                  }
+
+                  if !runtime.ready && !runtime.emulator.is_preparing() {
+                      runtime.ready = true;
+                      tracing::info!("[tick] emulator ready");
+                  }
+
+                  runtime.store.flush(false);
+                  overlay::note_tick(now.elapsed());
+                  true
+              })
+          }
+
+          pub fn key(code: i32, down: bool) {
+              if let Some(key) = key_from_code(code) {
+                  lock(&KEYS).push_back((key, down));
+              }
+          }
+
+          pub fn poll_out() -> Option<Vec<u8>> {
+              lock(&OUT).pop_front()
+          }
+
+          pub fn last_error() -> String {
+              lock(&LAST_ERROR).clone()
+          }
+
+          pub fn screen_size() -> (u32, u32) {
+              (WIDTH.load(Ordering::Relaxed), HEIGHT.load(Ordering::Relaxed))
+          }
+
+          fn guarded<R>(fallback: R, f: impl FnOnce() -> R) -> R {
+              match catch_unwind(AssertUnwindSafe(f)) {
+                  Ok(value) => value,
+                  Err(panic) => {
+                      let message = panic
+                          .downcast_ref::<&str>()
+                          .map(|s| s.to_string())
+                          .or_else(|| panic.downcast_ref::<String>().cloned())
+                          .unwrap_or_else(|| "unknown panic".into());
+                      set_error(format!("panic: {message}"));
+                      RUNTIME.with_borrow_mut(|runtime| {
+                          if let Some(runtime) = runtime.as_mut() {
+                              runtime.failed = true;
+                          }
+                      });
+                      fallback
+                  }
+              }
+          }
+
+          // ---------------------------------------------------------------- JNI
+
+          fn byte_array(env: &mut JNIEnv<'_>, bytes: Option<Vec<u8>>) -> jbyteArray {
+              match bytes {
+                  Some(bytes) => env
+                      .byte_array_from_slice(&bytes)
+                      .map(JByteArray::into_raw)
+                      .unwrap_or(std::ptr::null_mut()),
+                  None => std::ptr::null_mut(),
+              }
+          }
+
+          #[unsafe(no_mangle)]
+          pub extern "system" fn Java_net_wie_app_WieNative_nativeInit<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>, zip: JByteArray<'l>, dir: JString<'l>) -> jint {
+              let zip = match env.convert_byte_array(&zip) {
+                  Ok(zip) => zip,
+                  Err(error) => {
+                      set_error(format!("cannot read game data: {error}"));
+                      return 1;
+                  }
+              };
+              let dir: String = match env.get_string(&dir) {
+                  Ok(dir) => dir.into(),
+                  Err(error) => {
+                      set_error(format!("cannot read files dir: {error}"));
+                      return 1;
+                  }
+              };
+
+              guarded(1, || match init(zip, Path::new(&dir)) {
+                  Ok(()) => 0,
+                  Err(error) => {
+                      set_error(format!("{error:#}"));
+                      1
+                  }
+              })
+          }
+
+          #[unsafe(no_mangle)]
+          pub extern "system" fn Java_net_wie_app_WieNative_nativeTick<'l>(_env: JNIEnv<'l>, _class: JClass<'l>) {
+              guarded((), || {
+                  tick();
+              })
+          }
+
+          #[unsafe(no_mangle)]
+          pub extern "system" fn Java_net_wie_app_WieNative_nativeKey<'l>(_env: JNIEnv<'l>, _class: JClass<'l>, code: jint, down: jboolean) {
+              key(code, down != 0);
+          }
+
+          #[unsafe(no_mangle)]
+          pub extern "system" fn Java_net_wie_app_WieNative_nativeSetSurface<'l>(env: JNIEnv<'l>, _class: JClass<'l>, surface: JObject<'l>) {
+              guarded((), || {
+                  window::set_surface(&env, &surface);
+                  REDRAW.store(true, Ordering::Relaxed);
+              })
+          }
+
+          #[unsafe(no_mangle)]
+          pub extern "system" fn Java_net_wie_app_WieNative_nativePollOut<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>) -> jbyteArray {
+              let message = poll_out();
+              byte_array(&mut env, message)
+          }
+
+          #[unsafe(no_mangle)]
+          pub extern "system" fn Java_net_wie_app_WieNative_nativeLastError<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>) -> jbyteArray {
+              let error = last_error();
+              byte_array(&mut env, Some(error.into_bytes()))
+          }
+
+          #[unsafe(no_mangle)]
+          pub extern "system" fn Java_net_wie_app_WieNative_nativeProfileText<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>, _reset: jboolean) -> jbyteArray {
+              byte_array(&mut env, Some(overlay::status_line().into_bytes()))
+          }
+
+          #[unsafe(no_mangle)]
+          pub extern "system" fn Java_net_wie_app_WieNative_nativeWidth<'l>(_env: JNIEnv<'l>, _class: JClass<'l>) -> jint {
+              WIDTH.load(Ordering::Relaxed) as jint
+          }
+
+          #[unsafe(no_mangle)]
+          pub extern "system" fn Java_net_wie_app_WieNative_nativeHeight<'l>(_env: JNIEnv<'l>, _class: JClass<'l>) -> jint {
+              HEIGHT.load(Ordering::Relaxed) as jint
+          }
+
+          // ---------------------------------------------------------------- logging
+
+          mod logging {
+              use std::{io, sync::Once};
+
+              static INIT: Once = Once::new();
+
+              #[cfg(target_os = "android")]
+              mod sink {
+                  use std::ffi::{CString, c_char, c_int};
+
+                  #[link(name = "log")]
+                  unsafe extern "C" {
+                      fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+                  }
+
+                  pub fn write(line: &str) {
+                      const ANDROID_LOG_INFO: c_int = 4;
+                      let tag = c"wie";
+                      if let Ok(text) = CString::new(line.replace('\0', " ")) {
+                          unsafe { __android_log_write(ANDROID_LOG_INFO, tag.as_ptr(), text.as_ptr()) };
+                      }
+                  }
+              }
+
+              #[cfg(not(target_os = "android"))]
+              mod sink {
+                  pub fn write(line: &str) {
+                      eprintln!("{line}");
+                  }
+              }
+
+              struct LineWriter(Vec<u8>);
+
+              impl io::Write for LineWriter {
+                  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                      self.0.extend_from_slice(buf);
+                      Ok(buf.len())
+                  }
+
+                  fn flush(&mut self) -> io::Result<()> {
+                      Ok(())
+                  }
+              }
+
+              impl Drop for LineWriter {
+                  fn drop(&mut self) {
+                      let text = String::from_utf8_lossy(&self.0);
+                      for line in text.lines().filter(|line| !line.is_empty()) {
+                          crate::overlay::note_log_line(line);
+                          sink::write(line);
+                      }
+                  }
+              }
+
+              pub fn init() {
+                  INIT.call_once(|| {
+                      let _ = tracing_subscriber::fmt()
+                          .with_max_level(match std::env::var("WIE_LOG").as_deref() {
+                              Ok("trace") => tracing::Level::TRACE,
+                              Ok("debug") => tracing::Level::DEBUG,
+                              _ => tracing::Level::INFO,
+                          })
+                          .with_ansi(false)
+                          .without_time()
+                          .with_target(false)
+                          .with_writer(|| LineWriter(Vec::new()))
+                          .try_init();
+                  });
+              }
+          }
+          WIE_EOF
+          mkdir -p $(dirname wie_jni/src/overlay.rs)
+          cat > wie_jni/src/overlay.rs <<'WIE_EOF'
+          //! A diagnostic read-out stamped onto the frame before it reaches the surface.
+          //!
+          //! The Java shell's own profile overlay is dead code in the shipped build (nothing
+          //! calls `startProfileOverlay`, and `profileView` is never created), and logcat needs
+          //! a root-granted reader. Drawing straight into the frame needs neither, so the engine
+          //! can report whether the ARM JIT actually took over and how fast the guest is running.
+          //!
+          //! Set `WIE_OVERLAY=0` to turn it off.
+
+          use std::{
+              sync::{
+                  Mutex,
+                  atomic::{AtomicU32, AtomicU64, Ordering},
+              },
+              time::{Duration, Instant},
+          };
+
+          /// What wie's own logs said about the ARM JIT, as captured by the logging sink.
+          #[derive(Clone, Copy, PartialEq, Eq)]
+          pub enum Jit {
+              /// No AOT line seen yet — still preparing, or the backend was never built in.
+              Unknown,
+              Installed,
+              Failed,
+          }
+
+          static JIT: Mutex<Jit> = Mutex::new(Jit::Unknown);
+          static FRAMES: AtomicU64 = AtomicU64::new(0);
+          static TICK_MICROS: AtomicU64 = AtomicU64::new(0);
+          static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+          static FPS_TIMES_10: AtomicU32 = AtomicU32::new(0);
+          static TICK_MS_TIMES_10: AtomicU32 = AtomicU32::new(0);
+          static WINDOW: Mutex<Option<Instant>> = Mutex::new(None);
+
+          fn lock<T>(mutex: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
+              mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+          }
+
+          /// Called for every log line so the JIT verdict can be read off wie's own messages.
+          pub fn note_log_line(line: &str) {
+              if !line.contains("AOT") {
+                  return;
+              }
+              let verdict = if line.contains("installed") {
+                  Jit::Installed
+              } else if line.contains("failed") {
+                  Jit::Failed
+              } else {
+                  return;
+              };
+              *lock(&JIT) = verdict;
+          }
+
+          /// Records one completed `nativeTick`, and recomputes the rates once a second.
+          pub fn note_tick(elapsed: Duration) {
+              TICK_MICROS.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+              TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+
+              let mut window = lock(&WINDOW);
+              let start = window.get_or_insert_with(Instant::now);
+              let span = start.elapsed();
+              if span < Duration::from_secs(1) {
+                  return;
+              }
+
+              let frames = FRAMES.swap(0, Ordering::Relaxed);
+              let ticks = TICK_COUNT.swap(0, Ordering::Relaxed);
+              let micros = TICK_MICROS.swap(0, Ordering::Relaxed);
+              FPS_TIMES_10.store((frames as f64 * 10.0 / span.as_secs_f64()) as u32, Ordering::Relaxed);
+              TICK_MS_TIMES_10.store(if ticks == 0 { 0 } else { (micros / ticks / 100) as u32 }, Ordering::Relaxed);
+              *window = Some(Instant::now());
+          }
+
+          pub fn note_frame() {
+              FRAMES.fetch_add(1, Ordering::Relaxed);
+          }
+
+          fn enabled() -> bool {
+              !matches!(std::env::var("WIE_OVERLAY").as_deref(), Ok("0"))
+          }
+
+          /// e.g. `JIT ON 58.2F 4.1MS`
+          pub fn status_line() -> String {
+              let jit = match *lock(&JIT) {
+                  // No verdict: either the backend was never compiled in, or it is still preparing.
+                  Jit::Unknown if cfg!(feature = "jit") => "JIT ?",
+                  Jit::Unknown => "JIT NO",
+                  Jit::Installed => "JIT ON",
+                  Jit::Failed => "JIT OFF",
+              };
+              let fps = FPS_TIMES_10.load(Ordering::Relaxed);
+              let tick = TICK_MS_TIMES_10.load(Ordering::Relaxed);
+              format!("{jit} {}.{}F {}.{}MS", fps / 10, fps % 10, tick / 10, tick % 10)
+          }
+
+          // A 5x7 bitmap font, one byte per column, low bit at the top. Only the characters the
+          // status line can produce are defined; anything else is drawn as a blank.
+          fn glyph(character: char) -> [u8; 5] {
+              match character {
+                  '0' => [0x3e, 0x51, 0x49, 0x45, 0x3e],
+                  '1' => [0x00, 0x42, 0x7f, 0x40, 0x00],
+                  '2' => [0x42, 0x61, 0x51, 0x49, 0x46],
+                  '3' => [0x21, 0x41, 0x45, 0x4b, 0x31],
+                  '4' => [0x18, 0x14, 0x12, 0x7f, 0x10],
+                  '5' => [0x27, 0x45, 0x45, 0x45, 0x39],
+                  '6' => [0x3c, 0x4a, 0x49, 0x49, 0x30],
+                  '7' => [0x01, 0x71, 0x09, 0x05, 0x03],
+                  '8' => [0x36, 0x49, 0x49, 0x49, 0x36],
+                  '9' => [0x06, 0x49, 0x49, 0x29, 0x1e],
+                  'F' => [0x7f, 0x09, 0x09, 0x09, 0x01],
+                  'I' => [0x00, 0x41, 0x7f, 0x41, 0x00],
+                  'J' => [0x20, 0x40, 0x41, 0x3f, 0x01],
+                  'M' => [0x7f, 0x02, 0x0c, 0x02, 0x7f],
+                  'N' => [0x7f, 0x04, 0x08, 0x10, 0x7f],
+                  'O' => [0x3e, 0x41, 0x41, 0x41, 0x3e],
+                  'S' => [0x46, 0x49, 0x49, 0x49, 0x31],
+                  'T' => [0x01, 0x01, 0x7f, 0x01, 0x01],
+                  '.' => [0x00, 0x60, 0x60, 0x00, 0x00],
+                  '?' => [0x02, 0x01, 0x51, 0x09, 0x06],
+                  _ => [0; 5],
+              }
+          }
+
+          /// Stamps `text` into an RGBA buffer at the top-left, over a black band.
+          pub fn draw(rgba: &mut [u8], width: u32, height: u32, text: &str) {
+              if !enabled() || width < 8 || height < 10 {
+                  return;
+              }
+              let (width, height) = (width as usize, height as usize);
+              let put = |rgba: &mut [u8], x: usize, y: usize, value: [u8; 3]| {
+                  if x >= width || y >= height {
+                      return;
+                  }
+                  let offset = (y * width + x) * 4;
+                  if let Some(pixel) = rgba.get_mut(offset..offset + 3) {
+                      pixel.copy_from_slice(&value);
+                  }
+              };
+
+              for y in 0..9 {
+                  for x in 0..width {
+                      put(rgba, x, y, [0, 0, 0]);
+                  }
+              }
+              for (index, character) in text.chars().enumerate() {
+                  let origin = 1 + index * 6;
+                  if origin + 5 >= width {
+                      break;
+                  }
+                  for (column, bits) in glyph(character.to_ascii_uppercase()).into_iter().enumerate() {
+                      for row in 0..7 {
+                          if bits & (1 << row) != 0 {
+                              put(rgba, origin + column, 1 + row, [0, 0xff, 0x40]);
+                          }
+                      }
+                  }
+              }
+          }
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+
+              #[test]
+              fn reads_the_jit_verdict_off_wie_log_lines() {
+                  note_log_line("Create thread: 1");
+                  assert!(matches!(*lock(&JIT), Jit::Unknown));
+                  note_log_line("ARM AOT preparation failed; using interpreter");
+                  assert!(matches!(*lock(&JIT), Jit::Failed));
+                  note_log_line("ARM AOT installed");
+                  assert!(matches!(*lock(&JIT), Jit::Installed));
+              }
+
+              #[test]
+              fn draws_only_inside_the_buffer() {
+                  let (width, height) = (40u32, 12u32);
+                  let mut rgba = vec![0xffu8; (width * height * 4) as usize];
+                  draw(&mut rgba, width, height, "JIT ON 9.9F");
+                  // The band is blacked out and at least one glyph pixel is lit.
+                  assert_eq!(&rgba[0..3], &[0, 0, 0]);
+                  assert!(rgba.chunks(4).any(|pixel| pixel[1] == 0xff && pixel[0] == 0));
+                  // Rows below the band are untouched.
+                  let below = (10 * width) as usize * 4;
+                  assert_eq!(&rgba[below..below + 3], &[0xff, 0xff, 0xff]);
+              }
+          }
+          WIE_EOF
+          mkdir -p $(dirname wie_jni/src/store.rs)
+          cat > wie_jni/src/store.rs <<'WIE_EOF'
+          //! Persistent storage for the app's files and record databases.
+          //!
+          //! The Java shell exports/imports saves by reading and writing two text files in
+          //! `getFilesDir()`: `wie_fs_v1` and `wie_db_v1`. Their content is opaque to Java,
+          //! so the only requirement is that this module can read back what it wrote.
+          //!
+          //! Format (one entry per line, all fields hex encoded, tab separated):
+          //!   wie_fs_v1:  `F<TAB>hex(aid)<TAB>hex(path)<TAB>hex(data)`
+          //!   wie_db_v1:  `D<TAB>hex(app_id)<TAB>hex(name)`                 (database exists)
+          //!               `R<TAB>hex(app_id)<TAB>hex(name)<TAB>id<TAB>hex(data)`  (record)
+
+          use std::{
+              collections::BTreeMap,
+              fs,
+              path::{Path, PathBuf},
+              sync::{Arc, Mutex, MutexGuard},
+              time::{Duration, Instant},
+          };
+
+          use wie_backend::RecordId;
+
+          pub const FS_FILE: &str = "wie_fs_v1";
+          pub const DB_FILE: &str = "wie_db_v1";
+          const HEADER: &str = "WIEJNI1";
+          const FLUSH_DELAY: Duration = Duration::from_millis(300);
+
+          type FileKey = (String, String);
+          type DbKey = (String, String);
+
+          #[derive(Default)]
+          struct Inner {
+              files: BTreeMap<FileKey, Vec<u8>>,
+              dbs: BTreeMap<DbKey, BTreeMap<RecordId, Vec<u8>>>,
+              fs_dirty_since: Option<Instant>,
+              db_dirty_since: Option<Instant>,
+          }
+
+          #[derive(Clone)]
+          pub struct Store {
+              dir: Arc<PathBuf>,
+              inner: Arc<Mutex<Inner>>,
+          }
+
+          fn hex(data: &[u8]) -> String {
+              const DIGITS: &[u8; 16] = b"0123456789abcdef";
+              let mut out = String::with_capacity(data.len() * 2);
+              for byte in data {
+                  out.push(DIGITS[(byte >> 4) as usize] as char);
+                  out.push(DIGITS[(byte & 0xf) as usize] as char);
+              }
+              out
+          }
+
+          fn unhex(text: &str) -> Option<Vec<u8>> {
+              if text.len() % 2 != 0 {
+                  return None;
+              }
+              (0..text.len())
+                  .step_by(2)
+                  .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+                  .collect()
+          }
+
+          fn unhex_str(text: &str) -> Option<String> {
+              String::from_utf8(unhex(text)?).ok()
+          }
+
+          impl Store {
+              pub fn open(dir: &Path) -> Self {
+                  let mut inner = Inner::default();
+
+                  if let Ok(text) = fs::read_to_string(dir.join(FS_FILE)) {
+                      for line in text.lines().skip_while(|line| *line == HEADER) {
+                          let parts: Vec<&str> = line.split('\t').collect();
+                          if let ["F", aid, path, data] = parts.as_slice()
+                              && let (Some(aid), Some(path), Some(data)) = (unhex_str(aid), unhex_str(path), unhex(data))
+                          {
+                              inner.files.insert((aid, path), data);
+                          }
+                      }
+                  }
+
+                  if let Ok(text) = fs::read_to_string(dir.join(DB_FILE)) {
+                      for line in text.lines().skip_while(|line| *line == HEADER) {
+                          let parts: Vec<&str> = line.split('\t').collect();
+                          match parts.as_slice() {
+                              ["D", app, name] => {
+                                  if let (Some(app), Some(name)) = (unhex_str(app), unhex_str(name)) {
+                                      inner.dbs.entry((app, name)).or_default();
+                                  }
+                              }
+                              ["R", app, name, id, data] => {
+                                  if let (Some(app), Some(name), Ok(id), Some(data)) = (unhex_str(app), unhex_str(name), id.parse(), unhex(data)) {
+                                      inner.dbs.entry((app, name)).or_default().insert(id, data);
+                                  }
+                              }
+                              _ => {}
+                          }
+                      }
+                  }
+
+                  tracing::info!("[store] loaded {} files, {} databases", inner.files.len(), inner.dbs.len());
+
+                  Self {
+                      dir: Arc::new(dir.to_owned()),
+                      inner: Arc::new(Mutex::new(inner)),
+                  }
+              }
+
+              fn lock(&self) -> MutexGuard<'_, Inner> {
+                  self.inner.lock().unwrap_or_else(|poison| poison.into_inner())
+              }
+
+              fn write_atomic(&self, name: &str, text: &str) {
+                  let target = self.dir.join(name);
+                  let temp = self.dir.join(format!("{name}.tmp"));
+                  let result = fs::write(&temp, text).and_then(|_| fs::rename(&temp, &target));
+                  if let Err(error) = result {
+                      tracing::error!("[store] failed to write {name}: {error}");
+                  }
+              }
+
+              /// Writes pending changes once they have settled for a moment, or immediately when `force`.
+              pub fn flush(&self, force: bool) {
+                  let (fs_text, db_text) = {
+                      let mut inner = self.lock();
+                      let due = |since: Option<Instant>| since.is_some_and(|since| force || since.elapsed() >= FLUSH_DELAY);
+
+                      let fs_text = due(inner.fs_dirty_since).then(|| {
+                          let mut text = String::from(HEADER);
+                          for ((aid, path), data) in &inner.files {
+                              text.push_str(&format!("\nF\t{}\t{}\t{}", hex(aid.as_bytes()), hex(path.as_bytes()), hex(data)));
+                          }
+                          text.push('\n');
+                          text
+                      });
+                      let db_text = due(inner.db_dirty_since).then(|| {
+                          let mut text = String::from(HEADER);
+                          for ((app, name), records) in &inner.dbs {
+                              let (app, name) = (hex(app.as_bytes()), hex(name.as_bytes()));
+                              text.push_str(&format!("\nD\t{app}\t{name}"));
+                              for (id, data) in records {
+                                  text.push_str(&format!("\nR\t{app}\t{name}\t{id}\t{}", hex(data)));
+                              }
+                          }
+                          text.push('\n');
+                          text
+                      });
+
+                      if fs_text.is_some() {
+                          inner.fs_dirty_since = None;
+                      }
+                      if db_text.is_some() {
+                          inner.db_dirty_since = None;
+                      }
+                      (fs_text, db_text)
+                  };
+
+                  if let Some(text) = fs_text {
+                      self.write_atomic(FS_FILE, &text);
+                  }
+                  if let Some(text) = db_text {
+                      self.write_atomic(DB_FILE, &text);
+                  }
+              }
+
+              fn mark_fs(inner: &mut Inner) {
+                  inner.fs_dirty_since.get_or_insert_with(Instant::now);
+              }
+
+              fn mark_db(inner: &mut Inner) {
+                  inner.db_dirty_since.get_or_insert_with(Instant::now);
+              }
+          }
+
+          fn normalize(path: &str) -> Option<String> {
+              let parts: Vec<&str> = path.split(['/', '\\']).filter(|part| !part.is_empty() && *part != ".").collect();
+              if parts.is_empty() || parts.contains(&"..") {
+                  return None;
+              }
+              Some(parts.join("/"))
+          }
+
+          #[async_trait::async_trait]
+          impl wie_backend::Filesystem for Store {
+              async fn exists(&self, aid: &str, path: &str) -> bool {
+                  let Some(path) = normalize(path) else { return false };
+                  self.lock().files.contains_key(&(aid.to_owned(), path))
+              }
+
+              async fn size(&self, aid: &str, path: &str) -> Option<usize> {
+                  let path = normalize(path)?;
+                  self.lock().files.get(&(aid.to_owned(), path)).map(Vec::len)
+              }
+
+              async fn read(&self, aid: &str, path: &str, offset: usize, count: usize, buf: &mut [u8]) -> Option<usize> {
+                  let path = normalize(path)?;
+                  let inner = self.lock();
+                  let data = inner.files.get(&(aid.to_owned(), path))?;
+                  if offset >= data.len() {
+                      return Some(0);
+                  }
+                  let n = count.min(data.len() - offset).min(buf.len());
+                  buf[..n].copy_from_slice(&data[offset..offset + n]);
+                  Some(n)
+              }
+
+              async fn write(&self, aid: &str, path: &str, offset: usize, data: &[u8]) -> usize {
+                  let Some(path) = normalize(path) else {
+                      tracing::warn!(aid, path, "[store] rejected write path");
+                      return 0;
+                  };
+                  let mut inner = self.lock();
+                  let file = inner.files.entry((aid.to_owned(), path)).or_default();
+                  if file.len() < offset + data.len() {
+                      file.resize(offset + data.len(), 0);
+                  }
+                  file[offset..offset + data.len()].copy_from_slice(data);
+                  Self::mark_fs(&mut inner);
+                  data.len()
+              }
+
+              async fn truncate(&self, aid: &str, path: &str, len: usize) {
+                  let Some(path) = normalize(path) else {
+                      tracing::warn!(aid, path, "[store] rejected truncate path");
+                      return;
+                  };
+                  let mut inner = self.lock();
+                  inner.files.entry((aid.to_owned(), path)).or_default().resize(len, 0);
+                  Self::mark_fs(&mut inner);
+              }
+          }
+
+          #[async_trait::async_trait]
+          impl wie_backend::DatabaseRepository for Store {
+              async fn open(&self, name: &str, app_id: &str) -> Box<dyn wie_backend::Database> {
+                  let key = (app_id.to_owned(), name.to_owned());
+                  {
+                      let mut inner = self.lock();
+                      if !inner.dbs.contains_key(&key) {
+                          inner.dbs.insert(key.clone(), BTreeMap::new());
+                          Self::mark_db(&mut inner);
+                      }
+                  }
+                  Box::new(Db { store: self.clone(), key })
+              }
+
+              async fn exists(&self, name: &str, app_id: &str) -> bool {
+                  self.lock().dbs.contains_key(&(app_id.to_owned(), name.to_owned()))
+              }
+
+              async fn delete(&self, name: &str, app_id: &str) -> bool {
+                  let mut inner = self.lock();
+                  let removed = inner.dbs.remove(&(app_id.to_owned(), name.to_owned())).is_some();
+                  if removed {
+                      Self::mark_db(&mut inner);
+                  }
+                  removed
+              }
+
+              async fn usage(&self, app_id: &str) -> u64 {
+                  self.lock()
+                      .dbs
+                      .iter()
+                      .filter(|((app, _), _)| app == app_id)
+                      .flat_map(|(_, records)| records.values())
+                      .map(|data| data.len() as u64)
+                      .sum()
+              }
+          }
+
+          struct Db {
+              store: Store,
+              key: DbKey,
+          }
+
+          impl Db {
+              fn with<R>(&self, f: impl FnOnce(&mut BTreeMap<RecordId, Vec<u8>>, &mut bool) -> R) -> R {
+                  let mut inner = self.store.lock();
+                  let mut changed = false;
+                  let result = f(inner.dbs.entry(self.key.clone()).or_default(), &mut changed);
+                  if changed {
+                      Store::mark_db(&mut inner);
+                  }
+                  result
+              }
+          }
+
+          #[async_trait::async_trait]
+          impl wie_backend::Database for Db {
+              async fn next_id(&self) -> RecordId {
+                  // MIDP requires the first record id to be 1.
+                  self.with(|records, _| records.keys().next_back().map_or(1, |id| id + 1))
+              }
+
+              async fn add(&mut self, data: &[u8]) -> RecordId {
+                  self.with(|records, changed| {
+                      let id = records.keys().next_back().map_or(1, |id| id + 1);
+                      records.insert(id, data.to_vec());
+                      *changed = true;
+                      id
+                  })
+              }
+
+              async fn get(&self, id: RecordId) -> Option<Vec<u8>> {
+                  self.with(|records, _| records.get(&id).cloned())
+              }
+
+              async fn set(&mut self, id: RecordId, data: &[u8]) -> bool {
+                  self.with(|records, changed| {
+                      records.insert(id, data.to_vec());
+                      *changed = true;
+                      true
+                  })
+              }
+
+              async fn delete(&mut self, id: RecordId) -> bool {
+                  self.with(|records, changed| {
+                      let removed = records.remove(&id).is_some();
+                      *changed |= removed;
+                      removed
+                  })
+              }
+
+              async fn get_record_ids(&self) -> Vec<RecordId> {
+                  self.with(|records, _| records.keys().copied().collect())
+              }
+          }
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+              use wie_backend::{Database as _, DatabaseRepository, Filesystem as _};
+
+              fn block<F: std::future::Future>(future: F) -> F::Output {
+                  // The store never awaits anything, so a single poll completes every call.
+                  let waker = std::task::Waker::noop();
+                  let mut cx = std::task::Context::from_waker(waker);
+                  let mut future = std::pin::pin!(future);
+                  match future.as_mut().poll(&mut cx) {
+                      std::task::Poll::Ready(value) => value,
+                      std::task::Poll::Pending => panic!("store future did not complete"),
+                  }
+              }
+
+              #[test]
+              fn round_trips_files_and_records() {
+                  let dir = std::env::temp_dir().join(format!("wie_jni_store_{}", std::process::id()));
+                  let _ = fs::remove_dir_all(&dir);
+                  fs::create_dir_all(&dir).unwrap();
+
+                  let store = Store::open(&dir);
+                  assert_eq!(block(store.write("app", "/save/a.dat", 2, b"xy")), 2);
+                  let mut db = block(store.open("rec", "app"));
+                  assert_eq!(block(db.add(b"one")), 1);
+                  assert_eq!(block(db.add(b"two")), 2);
+                  store.flush(true);
+
+                  let reopened = Store::open(&dir);
+                  let mut buf = [0u8; 8];
+                  assert_eq!(block(reopened.read("app", "save/a.dat", 0, 8, &mut buf)), Some(4));
+                  assert_eq!(&buf[..4], b"\0\0xy");
+                  let db = block(reopened.open("rec", "app"));
+                  assert_eq!(block(db.get_record_ids()), vec![1, 2]);
+                  assert_eq!(block(db.get(2)).as_deref(), Some(&b"two"[..]));
+                  assert!(block(DatabaseRepository::exists(&reopened, "rec", "app")));
+
+                  let _ = fs::remove_dir_all(&dir);
+              }
+          }
+          WIE_EOF
+          mkdir -p $(dirname wie_jni/src/window.rs)
+          cat > wie_jni/src/window.rs <<'WIE_EOF'
+          #![allow(non_snake_case)]
+          //! Presents emulator frames on the Android `Surface` handed over by `GameView`.
+          //!
+          //! Only a handful of `libandroid` functions are needed, so they are declared here
+          //! directly. The `#[link]` attribute is applied on Android only, which keeps the
+          //! crate buildable (and testable) on a desktop host.
+
+          use std::{ffi::c_void, sync::Mutex};
+
+          use jni::{JNIEnv, objects::JObject};
+
+          #[repr(C)]
+          pub(crate) struct ANativeWindowBuffer {
+              width: i32,
+              height: i32,
+              stride: i32,
+              format: i32,
+              bits: *mut c_void,
+              reserved: [u32; 6],
+          }
+
+          const WINDOW_FORMAT_RGBA_8888: i32 = 1;
+
+          #[cfg(target_os = "android")]
+          #[link(name = "android")]
+          unsafe extern "C" {
+              fn ANativeWindow_fromSurface(env: *mut jni::sys::JNIEnv, surface: jni::sys::jobject) -> *mut c_void;
+              fn ANativeWindow_release(window: *mut c_void);
+              fn ANativeWindow_setBuffersGeometry(window: *mut c_void, width: i32, height: i32, format: i32) -> i32;
+              fn ANativeWindow_lock(window: *mut c_void, out_buffer: *mut ANativeWindowBuffer, in_out_dirty_bounds: *mut c_void) -> i32;
+              fn ANativeWindow_unlockAndPost(window: *mut c_void) -> i32;
+          }
+
+          // Host builds (tests, headless runs) have no surface; frames are only kept in memory.
+          #[cfg(not(target_os = "android"))]
+          mod host {
+              use std::ffi::c_void;
+
+              pub unsafe fn ANativeWindow_fromSurface(_env: *mut jni::sys::JNIEnv, _surface: jni::sys::jobject) -> *mut c_void {
+                  std::ptr::null_mut()
+              }
+              pub unsafe fn ANativeWindow_release(_window: *mut c_void) {}
+              pub unsafe fn ANativeWindow_setBuffersGeometry(_window: *mut c_void, _width: i32, _height: i32, _format: i32) -> i32 {
+                  -1
+              }
+              pub unsafe fn ANativeWindow_lock(_window: *mut c_void, _out_buffer: *mut super::ANativeWindowBuffer, _dirty: *mut c_void) -> i32 {
+                  -1
+              }
+              pub unsafe fn ANativeWindow_unlockAndPost(_window: *mut c_void) -> i32 {
+                  -1
+              }
+          }
+          #[cfg(not(target_os = "android"))]
+          use host::*;
+
+          /// The last emulator frame as RGBA bytes, kept so it can be redrawn on a new surface.
+          pub struct Frame {
+              pub width: u32,
+              pub height: u32,
+              pub rgba: Vec<u8>,
+          }
+
+          struct State {
+              window: usize, // ANativeWindow*, 0 when absent
+              geometry: (u32, u32),
+              frame: Option<Frame>,
+          }
+
+          static STATE: Mutex<State> = Mutex::new(State {
+              window: 0,
+              geometry: (0, 0),
+              frame: None,
+          });
+
+          fn state() -> std::sync::MutexGuard<'static, State> {
+              STATE.lock().unwrap_or_else(|poison| poison.into_inner())
+          }
+
+          /// Called from the UI thread whenever the surface is created, changed or destroyed (null).
+          pub fn set_surface(env: &JNIEnv<'_>, surface: &JObject<'_>) {
+              let mut state = state();
+
+              if state.window != 0 {
+                  unsafe { ANativeWindow_release(state.window as *mut c_void) };
+                  state.window = 0;
+                  state.geometry = (0, 0);
+              }
+
+              if surface.is_null() {
+                  return;
+              }
+
+              let window = unsafe { ANativeWindow_fromSurface(env.get_raw(), surface.as_raw()) };
+              if window.is_null() {
+                  tracing::error!("[window] ANativeWindow_fromSurface returned null");
+                  return;
+              }
+              state.window = window as usize;
+              present_locked(&mut state);
+          }
+
+          /// Counts frames the guest has drawn, so host-side tests can measure emulation speed.
+          pub static PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+          /// Stores a new frame and draws it if a surface is available.
+          pub fn present(frame: Frame) {
+              PRESENTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+              let mut state = state();
+              state.frame = Some(frame);
+              present_locked(&mut state);
+          }
+
+          /// Copy of the most recent frame, used by host-side tests.
+          pub fn last_frame() -> Option<Frame> {
+              state().frame.as_ref().map(|frame| Frame {
+                  width: frame.width,
+                  height: frame.height,
+                  rgba: frame.rgba.clone(),
+              })
+          }
+
+          fn present_locked(state: &mut State) {
+              let window = state.window as *mut c_void;
+              if window.is_null() {
+                  return;
+              }
+              let Some(frame) = state.frame.as_ref() else { return };
+              let (width, height) = (frame.width, frame.height);
+
+              if state.geometry != (width, height) {
+                  // The compositor scales this buffer to the GameView's size.
+                  let result = unsafe { ANativeWindow_setBuffersGeometry(window, width as i32, height as i32, WINDOW_FORMAT_RGBA_8888) };
+                  if result != 0 {
+                      tracing::error!("[window] setBuffersGeometry failed: {result}");
+                      return;
+                  }
+                  state.geometry = (width, height);
+              }
+
+              let mut buffer = ANativeWindowBuffer {
+                  width: 0,
+                  height: 0,
+                  stride: 0,
+                  format: 0,
+                  bits: std::ptr::null_mut(),
+                  reserved: [0; 6],
+              };
+              if unsafe { ANativeWindow_lock(window, &mut buffer, std::ptr::null_mut()) } != 0 || buffer.bits.is_null() {
+                  tracing::warn!("[window] lock failed");
+                  return;
+              }
+
+              let rows = (buffer.height.max(0) as u32).min(height) as usize;
+              let cols = (buffer.width.max(0) as u32).min(width) as usize;
+              let stride_bytes = buffer.stride.max(0) as usize * 4;
+              let src_row_bytes = width as usize * 4;
+              let dst = buffer.bits as *mut u8;
+              for y in 0..rows {
+                  let src = &frame.rgba[y * src_row_bytes..y * src_row_bytes + cols * 4];
+                  unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.add(y * stride_bytes), cols * 4) };
+              }
+
+              unsafe { ANativeWindow_unlockAndPost(window) };
+          }
+          WIE_EOF
+          mkdir -p $(dirname wie_jni/src/aot_cache.rs)
+          cat > wie_jni/src/aot_cache.rs <<'WIE_EOF'
+          //! On-disk cache for `wie-core-arm-native`'s JIT output.
+          //!
+          //! Without this, `NativeExecutor` still JIT-compiles (it doesn't need a cache to
+          //! work), but every app launch re-compiles every region from scratch. Caching the
+          //! compiled artifacts under `filesDir/aot_cache/<hex key>` makes the second and
+          //! later launches skip that work. One file per cache key, no extra dependency
+          //! (plain hex, no sqlite).
+
+          #![cfg(feature = "jit")]
+
+          use std::{fs, path::PathBuf};
+
+          use wie_core_arm_native::NativeCache;
+          use wie_util::{Result, WieError};
+
+          pub struct FileCache {
+              directory: PathBuf,
+          }
+
+          impl FileCache {
+              pub fn new(directory: PathBuf) -> Self {
+                  Self { directory }
+              }
+
+              fn path(&self, key: &[u8; 32]) -> PathBuf {
+                  let mut name = String::with_capacity(64);
+                  for byte in key {
+                      name.push_str(&format!("{byte:02x}"));
+                  }
+                  self.directory.join(name)
+              }
+          }
+
+          impl NativeCache for FileCache {
+              fn load(&mut self, key: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+                  match fs::read(self.path(key)) {
+                      Ok(bytes) => Ok(Some(bytes)),
+                      Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                      Err(error) => Err(WieError::FatalError(error.to_string())),
+                  }
+              }
+
+              fn store(&mut self, key: &[u8; 32], artifact: &[u8]) -> Result<()> {
+                  fs::create_dir_all(&self.directory).map_err(|error| WieError::FatalError(error.to_string()))?;
+                  // Write-then-rename so a crash mid-write never leaves a corrupt cache file
+                  // that `load` would hand back as valid.
+                  let final_path = self.path(key);
+                  let tmp_path = final_path.with_extension("tmp");
+                  fs::write(&tmp_path, artifact).map_err(|error| WieError::FatalError(error.to_string()))?;
+                  fs::rename(&tmp_path, &final_path).map_err(|error| WieError::FatalError(error.to_string()))
+              }
+          }
+
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+
+              #[test]
+              fn roundtrips_and_overwrites() {
+                  let dir = tempfile_dir();
+                  let mut cache = FileCache::new(dir.clone());
+                  assert!(cache.load(&[0; 32]).unwrap().is_none());
+
+                  for bytes in [b"first".as_slice(), b"second, longer".as_slice()] {
+                      cache.store(&[7; 32], bytes).unwrap();
+                      assert_eq!(cache.load(&[7; 32]).unwrap().unwrap(), bytes);
+                  }
+                  let _ = fs::remove_dir_all(dir);
+              }
+
+              fn tempfile_dir() -> PathBuf {
+                  let dir = std::env::temp_dir().join(format!("wie_jni_aot_test_{}", std::process::id()));
+                  let _ = fs::remove_dir_all(&dir);
+                  dir
+              }
+          }
+          WIE_EOF
+          mkdir -p $(dirname wie-inotia2.patch)
+          cat > wie-inotia2.patch <<'PATCH_EOF'
+          diff --git a/wie-backend/src/audio_sink.rs b/wie-backend/src/audio_sink.rs
+          index 113f160..3549bd1 100644
+          --- a/wie-backend/src/audio_sink.rs
+          +++ b/wie-backend/src/audio_sink.rs
+          @@ -18,6 +18,8 @@ pub enum AudioCommand {
+           pub struct AudioSequence {
+               pub duration: u64,
+               pub events: Vec<TimedAudioEvent>,
+          +    /// Original SMAF bytes, kept so frontends with their own SMAF player can use them.
+          +    pub source: Option<Arc<[u8]>>,
+           }
+           
+           #[derive(Clone, Debug, PartialEq)]
+          diff --git a/wie-backend/src/system/audio.rs b/wie-backend/src/system/audio.rs
+          index 1a34896..5b0a293 100644
+          --- a/wie-backend/src/system/audio.rs
+          +++ b/wie-backend/src/system/audio.rs
+          @@ -28,7 +28,9 @@ impl Audio {
+           
+               pub fn load_smaf(&mut self, data: &[u8]) -> Result<AudioHandle, AudioError> {
+                   let audio_handle = self.last_audio_handle;
+          -        let sequence = Arc::new(convert_smaf_events(parse_smaf(data)));
+          +        let mut sequence = convert_smaf_events(parse_smaf(data));
+          +        sequence.source = Some(Arc::from(data));
+          +        let sequence = Arc::new(sequence);
+           
+                   self.last_audio_handle += 1;
+                   self.files.insert(audio_handle, sequence);
+          @@ -97,7 +99,11 @@ fn convert_smaf_events(events: Vec<(usize, SmafEvent)>) -> AudioSequence {
+                   })
+                   .collect();
+           
+          -    AudioSequence { duration, events }
+          +    AudioSequence {
+          +        duration,
+          +        events,
+          +        source: None,
+          +    }
+           }
+           
+           #[cfg(test)]
+          @@ -142,6 +148,7 @@ mod tests {
+                                   data: AudioEventData::Midi(vec![0xe3, 0x34, 0x24]),
+                               },
+                           ],
+          +                source: None,
+                       }
+                   );
+               }
+          diff --git a/wie-ktf/src/emulator.rs b/wie-ktf/src/emulator.rs
+          index 7eb890d..d60bfaa 100644
+          --- a/wie-ktf/src/emulator.rs
+          +++ b/wie-ktf/src/emulator.rs
+          @@ -127,7 +127,8 @@ impl KtfEmulator {
+                   let system = System::new(platform, pid, aid, KtfTaskRunner { core: core.clone() });
+           
+                   for (path, data) in files {
+          -            let path = path.trim_start_matches("P/");
+          +            // Handset dumps use either `P/` or `p/` for the app data directory.
+          +            let path = path.strip_prefix("P/").or_else(|| path.strip_prefix("p/")).unwrap_or(path);
+                       system.filesystem().add_virtual(path, data.clone());
+                   }
+           
+          diff --git a/wie-ktf/src/runtime/wipi_c/method_table.rs b/wie-ktf/src/runtime/wipi_c/method_table.rs
+          index 6243538..3699b12 100644
+          --- a/wie-ktf/src/runtime/wipi_c/method_table.rs
+          +++ b/wie-ktf/src/runtime/wipi_c/method_table.rs
+          @@ -375,7 +375,7 @@ pub fn get_method_body(table_id: WIPICTableId, function_id: u16) -> Option<WIPIC
+                       WIPICKernelMethodId::GetParentProgramId => Some(gen_stub(10, "MC_knlGetParentProgramID")),
+                       WIPICKernelMethodId::GetAppManagerId => Some(gen_stub(11, "MC_knlGetAppManagerID")),
+                       WIPICKernelMethodId::GetProgramInfo => Some(gen_stub(12, "MC_knlGetProgramInfo")),
+          -            WIPICKernelMethodId::GetAccessLevel => Some(gen_stub(13, "MC_knlGetAccessLevel")),
+          +            WIPICKernelMethodId::GetAccessLevel => Some(kernel::get_access_level.into_body()),
+                       WIPICKernelMethodId::GetProgramName => Some(kernel::get_program_name.into_body()),
+                       WIPICKernelMethodId::CreateSharedBuf => Some(gen_stub(15, "MC_knlCreateSharedBuf")),
+                       WIPICKernelMethodId::DestroySharedBuf => Some(gen_stub(16, "MC_knlDestroySharedBuf")),
+          diff --git a/wie-wipi-c/src/api/database.rs b/wie-wipi-c/src/api/database.rs
+          index 938c5c8..bb329c8 100644
+          --- a/wie-wipi-c/src/api/database.rs
+          +++ b/wie-wipi-c/src/api/database.rs
+          @@ -42,7 +42,7 @@ struct DatabaseHandle {
+           }
+           
+           const MIN_BUFFER_CAPACITY: u32 = 64;
+          -const KTF_DATABASE_STORAGE_LIMIT: u64 = 1024 * 1024;
+          +const KTF_DATABASE_STORAGE_LIMIT: u64 = 32 * 1024 * 1024;
+           // "MCDB" — sentinel at the start of the handle struct so we can distinguish
+           // a real DB handle pointer from an unrelated guest pointer (e.g. a C-string
+           // name pointer that KTF's slot 6 passes through the same SVC argument slot).
+          @@ -70,6 +70,7 @@ pub async fn open_database(context: &mut dyn WIPICContext, ptr_name: WIPICWord,
+               }
+           
+               let packaged = read_packaged_database(context, &name).await?;
+          +    tracing::debug!("MC_dbOpenDataBase name={name:?} packaged={:?}", packaged.as_ref().map(|x| x.len()));
+           
+               let system = context.system();
+               let pid = system.pid().to_owned();
+          @@ -502,6 +503,29 @@ pub async fn select_record_ktf(context: &mut dyn WIPICContext, db_id: i32, rec_i
+               //     mode=2 on the read path destroys a prefetched buffer during a
+               //     subsequent re-open and wipes the saved record). Both are treated
+               //     as plain seek-and-rewind.
+          +    //
+          +    // Some titles (e.g. Com2us's Inotia 2) use it as a real `lseek`: they
+          +    // query the size with `(handle, 0, 2)` and rely on the returned position.
+          +    // `WIE_KTF_DB_LSEEK` selects that behaviour: mode 0/1/2 = SET/CUR/END,
+          +    // and the resulting position is returned.
+          +    if option_env!("WIE_KTF_DB_LSEEK").is_some() {
+          +        let base = match mode {
+          +            0 => 0i64,
+          +            1 => handle.read_cursor as i64,
+          +            2 => handle.buffer_len as i64,
+          +            _ => return Ok(-22),
+          +        };
+          +        let position = base + rec_id as i64;
+          +        if position < 0 {
+          +            return Ok(-22);
+          +        }
+          +        let position = position as u32;
+          +        handle.read_cursor = position;
+          +        handle.write_cursor = position;
+          +        write_generic(context, db_id as _, handle)?;
+          +        return Ok(position as i32);
+          +    }
+          +
+               if rec_id >= 0 {
+                   let offset = rec_id as u32;
+                   handle.read_cursor = offset;
+          @@ -591,6 +615,17 @@ async fn get_database_from_db_id(context: &mut dyn WIPICContext, db_id: i32) ->
+           }
+           
+           async fn read_packaged_database(context: &mut dyn WIPICContext, name: &str) -> Result<Option<Vec<u8>>> {
+          +    // On KTF handsets a database is a file in the app's `P/` directory, and
+          +    // add-on data downloaded after install lives there too. Archives dumped
+          +    // from a handset carry those files, so prefer them over the jar copy.
+          +    let filesystem = context.system().filesystem().clone();
+          +    if let Some(size) = filesystem.size(name).await {
+          +        let mut data = vec![0; size];
+          +        let read = filesystem.read(name, 0, size, &mut data).await.unwrap_or(0);
+          +        data.truncate(read);
+          +        return Ok(Some(data));
+          +    }
+          +
+               if context.get_resource_size(name).await?.is_none() {
+                   return Ok(None);
+               }
+          diff --git a/wie-wipi-c/src/api/kernel.rs b/wie-wipi-c/src/api/kernel.rs
+          index 52de728..9a124c2 100644
+          --- a/wie-wipi-c/src/api/kernel.rs
+          +++ b/wie-wipi-c/src/api/kernel.rs
+          @@ -252,6 +252,12 @@ pub async fn sprintk(
+               Ok(result.len() as _)
+           }
+           
+          +pub async fn get_access_level(_context: &mut dyn WIPICContext) -> Result<i32> {
+          +    tracing::warn!("stub MC_knlGetAccessLevel()");
+          +
+          +    Ok(0)
+          +}
+          +
+           pub async fn get_total_memory(_context: &mut dyn WIPICContext) -> Result<i32> {
+               tracing::warn!("stub MC_knlGetTotalMemory()");
+           
+          PATCH_EOF
+
+      - name: Clone wie and apply fix patch
+        run: |
+          git clone https://github.com/dlunch/wie.git wie
+          cd wie
+          git apply ../wie-inotia2.patch
+          echo "--- patched files ---"
+          git diff --stat
+
       - name: Build libwie_jni.so (arm64-v8a)
         working-directory: wie_jni
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          WIE_KTF_DB_LSEEK: "1"
         run: cargo ndk -t arm64-v8a -o ../jniLibs build --release
 
       - uses: actions/upload-artifact@v4
