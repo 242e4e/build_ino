@@ -1,0 +1,162 @@
+diff --git a/wie-backend/src/audio_sink.rs b/wie-backend/src/audio_sink.rs
+index 113f160..3549bd1 100644
+--- a/wie-backend/src/audio_sink.rs
++++ b/wie-backend/src/audio_sink.rs
+@@ -18,6 +18,8 @@ pub enum AudioCommand {
+ pub struct AudioSequence {
+     pub duration: u64,
+     pub events: Vec<TimedAudioEvent>,
++    /// Original SMAF bytes, kept so frontends with their own SMAF player can use them.
++    pub source: Option<Arc<[u8]>>,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq)]
+diff --git a/wie-backend/src/system/audio.rs b/wie-backend/src/system/audio.rs
+index 1a34896..5b0a293 100644
+--- a/wie-backend/src/system/audio.rs
++++ b/wie-backend/src/system/audio.rs
+@@ -28,7 +28,9 @@ impl Audio {
+ 
+     pub fn load_smaf(&mut self, data: &[u8]) -> Result<AudioHandle, AudioError> {
+         let audio_handle = self.last_audio_handle;
+-        let sequence = Arc::new(convert_smaf_events(parse_smaf(data)));
++        let mut sequence = convert_smaf_events(parse_smaf(data));
++        sequence.source = Some(Arc::from(data));
++        let sequence = Arc::new(sequence);
+ 
+         self.last_audio_handle += 1;
+         self.files.insert(audio_handle, sequence);
+@@ -97,7 +99,11 @@ fn convert_smaf_events(events: Vec<(usize, SmafEvent)>) -> AudioSequence {
+         })
+         .collect();
+ 
+-    AudioSequence { duration, events }
++    AudioSequence {
++        duration,
++        events,
++        source: None,
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -142,6 +148,7 @@ mod tests {
+                         data: AudioEventData::Midi(vec![0xe3, 0x34, 0x24]),
+                     },
+                 ],
++                source: None,
+             }
+         );
+     }
+diff --git a/wie-ktf/src/emulator.rs b/wie-ktf/src/emulator.rs
+index 7eb890d..d60bfaa 100644
+--- a/wie-ktf/src/emulator.rs
++++ b/wie-ktf/src/emulator.rs
+@@ -127,7 +127,8 @@ impl KtfEmulator {
+         let system = System::new(platform, pid, aid, KtfTaskRunner { core: core.clone() });
+ 
+         for (path, data) in files {
+-            let path = path.trim_start_matches("P/");
++            // Handset dumps use either `P/` or `p/` for the app data directory.
++            let path = path.strip_prefix("P/").or_else(|| path.strip_prefix("p/")).unwrap_or(path);
+             system.filesystem().add_virtual(path, data.clone());
+         }
+ 
+diff --git a/wie-ktf/src/runtime/wipi_c/method_table.rs b/wie-ktf/src/runtime/wipi_c/method_table.rs
+index 6243538..3699b12 100644
+--- a/wie-ktf/src/runtime/wipi_c/method_table.rs
++++ b/wie-ktf/src/runtime/wipi_c/method_table.rs
+@@ -375,7 +375,7 @@ pub fn get_method_body(table_id: WIPICTableId, function_id: u16) -> Option<WIPIC
+             WIPICKernelMethodId::GetParentProgramId => Some(gen_stub(10, "MC_knlGetParentProgramID")),
+             WIPICKernelMethodId::GetAppManagerId => Some(gen_stub(11, "MC_knlGetAppManagerID")),
+             WIPICKernelMethodId::GetProgramInfo => Some(gen_stub(12, "MC_knlGetProgramInfo")),
+-            WIPICKernelMethodId::GetAccessLevel => Some(gen_stub(13, "MC_knlGetAccessLevel")),
++            WIPICKernelMethodId::GetAccessLevel => Some(kernel::get_access_level.into_body()),
+             WIPICKernelMethodId::GetProgramName => Some(kernel::get_program_name.into_body()),
+             WIPICKernelMethodId::CreateSharedBuf => Some(gen_stub(15, "MC_knlCreateSharedBuf")),
+             WIPICKernelMethodId::DestroySharedBuf => Some(gen_stub(16, "MC_knlDestroySharedBuf")),
+diff --git a/wie-wipi-c/src/api/database.rs b/wie-wipi-c/src/api/database.rs
+index 938c5c8..bb329c8 100644
+--- a/wie-wipi-c/src/api/database.rs
++++ b/wie-wipi-c/src/api/database.rs
+@@ -42,7 +42,7 @@ struct DatabaseHandle {
+ }
+ 
+ const MIN_BUFFER_CAPACITY: u32 = 64;
+-const KTF_DATABASE_STORAGE_LIMIT: u64 = 1024 * 1024;
++const KTF_DATABASE_STORAGE_LIMIT: u64 = 32 * 1024 * 1024;
+ // "MCDB" — sentinel at the start of the handle struct so we can distinguish
+ // a real DB handle pointer from an unrelated guest pointer (e.g. a C-string
+ // name pointer that KTF's slot 6 passes through the same SVC argument slot).
+@@ -70,6 +70,7 @@ pub async fn open_database(context: &mut dyn WIPICContext, ptr_name: WIPICWord,
+     }
+ 
+     let packaged = read_packaged_database(context, &name).await?;
++    tracing::debug!("MC_dbOpenDataBase name={name:?} packaged={:?}", packaged.as_ref().map(|x| x.len()));
+ 
+     let system = context.system();
+     let pid = system.pid().to_owned();
+@@ -502,6 +503,29 @@ pub async fn select_record_ktf(context: &mut dyn WIPICContext, db_id: i32, rec_i
+     //     mode=2 on the read path destroys a prefetched buffer during a
+     //     subsequent re-open and wipes the saved record). Both are treated
+     //     as plain seek-and-rewind.
++    //
++    // Some titles (e.g. Com2us's Inotia 2) use it as a real `lseek`: they
++    // query the size with `(handle, 0, 2)` and rely on the returned position.
++    // `WIE_KTF_DB_LSEEK` selects that behaviour: mode 0/1/2 = SET/CUR/END,
++    // and the resulting position is returned.
++    if option_env!("WIE_KTF_DB_LSEEK").is_some() {
++        let base = match mode {
++            0 => 0i64,
++            1 => handle.read_cursor as i64,
++            2 => handle.buffer_len as i64,
++            _ => return Ok(-22),
++        };
++        let position = base + rec_id as i64;
++        if position < 0 {
++            return Ok(-22);
++        }
++        let position = position as u32;
++        handle.read_cursor = position;
++        handle.write_cursor = position;
++        write_generic(context, db_id as _, handle)?;
++        return Ok(position as i32);
++    }
++
+     if rec_id >= 0 {
+         let offset = rec_id as u32;
+         handle.read_cursor = offset;
+@@ -591,6 +615,17 @@ async fn get_database_from_db_id(context: &mut dyn WIPICContext, db_id: i32) ->
+ }
+ 
+ async fn read_packaged_database(context: &mut dyn WIPICContext, name: &str) -> Result<Option<Vec<u8>>> {
++    // On KTF handsets a database is a file in the app's `P/` directory, and
++    // add-on data downloaded after install lives there too. Archives dumped
++    // from a handset carry those files, so prefer them over the jar copy.
++    let filesystem = context.system().filesystem().clone();
++    if let Some(size) = filesystem.size(name).await {
++        let mut data = vec![0; size];
++        let read = filesystem.read(name, 0, size, &mut data).await.unwrap_or(0);
++        data.truncate(read);
++        return Ok(Some(data));
++    }
++
+     if context.get_resource_size(name).await?.is_none() {
+         return Ok(None);
+     }
+diff --git a/wie-wipi-c/src/api/kernel.rs b/wie-wipi-c/src/api/kernel.rs
+index 52de728..9a124c2 100644
+--- a/wie-wipi-c/src/api/kernel.rs
++++ b/wie-wipi-c/src/api/kernel.rs
+@@ -252,6 +252,12 @@ pub async fn sprintk(
+     Ok(result.len() as _)
+ }
+ 
++pub async fn get_access_level(_context: &mut dyn WIPICContext) -> Result<i32> {
++    tracing::warn!("stub MC_knlGetAccessLevel()");
++
++    Ok(0)
++}
++
+ pub async fn get_total_memory(_context: &mut dyn WIPICContext) -> Result<i32> {
+     tracing::warn!("stub MC_knlGetTotalMemory()");
+ 

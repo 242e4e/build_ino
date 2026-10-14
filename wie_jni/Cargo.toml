@@ -1,0 +1,31 @@
+[package]
+name = "wie_jni"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "JNI glue that lets the existing net.wie.app.WieActivity shell run on upstream wie"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+jni = { version = "0.21", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+
+wie = { path = "../wie", default-features = false }
+wie-backend = { path = "../wie/wie-backend" }
+wie-core-arm-native = { path = "../wie/wie-core-arm-native" }
+wie-util = { path = "../wie/wie-util" }
+
+[dev-dependencies]
+png = "0.17"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "unwind"
